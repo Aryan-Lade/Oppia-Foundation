@@ -95,6 +95,187 @@ class FeedbackServicesUnitTests(test_utils.EmailTestBase):
         # stop, followed by the message id.
         self.assertEqual(datastore_id, '%s.%s' % (thread_id, message_id))
 
+    def test_create_thread_with_transaction_success(self) -> None:
+        """Test that thread and message are created successfully in a transaction."""
+        entity_type = 'exploration'
+        entity_id = 'exp_id_1'
+        original_author_id = self.user_id
+        subject = 'Test Subject'
+        text = 'Test message text'
+
+        thread_id = feedback_services.create_thread(
+            entity_type, entity_id, original_author_id, subject, text
+        )
+
+        # Verify thread was created
+        thread_model = feedback_models.GeneralFeedbackThreadModel.get_by_id(thread_id)
+        self.assertIsNotNone(thread_model)
+        self.assertEqual(thread_model.entity_type, entity_type)
+        self.assertEqual(thread_model.entity_id, entity_id)
+        self.assertEqual(thread_model.original_author_id, original_author_id)
+        self.assertEqual(thread_model.subject, subject)
+        self.assertEqual(thread_model.status, feedback_models.STATUS_CHOICES_OPEN)
+        self.assertEqual(thread_model.message_count, 1)
+
+        # Verify initial message was created and associated with thread
+        messages = feedback_services.get_messages(thread_id)
+        self.assertEqual(len(messages), 1)
+        message = messages[0]
+        self.assertEqual(message.entity_type, entity_type)
+        self.assertEqual(message.entity_id, entity_id)
+        self.assertEqual(message.original_author_id, original_author_id)
+        self.assertEqual(message.subject, subject)
+        self.assertEqual(message.text, text)
+
+    def test_create_thread_idempotent_handles_retries_safely(self) -> None:
+        """Test that the transactional function is idempotent and handles retries safely."""
+        entity_type = 'exploration'
+        entity_id = 'exp_id_2'
+        original_author_id = self.user_id
+        subject = 'Test Subject'
+        text = 'Test message text'
+
+        # Call create_thread twice with the same parameters
+        thread_id_1 = feedback_services.create_thread(
+            entity_type, entity_id, original_author_id, subject, text
+        )
+        thread_id_2 = feedback_services.create_thread(
+            entity_type, entity_id, original_author_id, subject, text
+        )
+
+        # Should return the same thread ID both times (idempotent)
+        self.assertEqual(thread_id_1, thread_id_2)
+
+        # Verify only one thread exists
+        threads = feedback_services.get_all_threads(entity_type, entity_id, False)
+        self.assertEqual(len(threads), 1)
+
+        # Verify thread has exactly one message
+        thread = threads[0]
+        messages = feedback_services.get_messages(thread.id)
+        self.assertEqual(len(messages), 1)
+
+    def test_create_thread_when_message_creation_fails_no_orphaned_thread(self) -> None:
+        """Test that if message creation fails, no orphaned thread is left behind."""
+        entity_type = 'exploration'
+        entity_id = 'exp_id_3'
+        original_author_id = self.user_id
+        subject = 'Test Subject'
+        text = 'Test message text'
+
+        # Mock create_message to simulate a failure
+        original_create_message = feedback_services.create_message
+
+        def mock_create_message_that_fails(*args, **kwargs):
+            raise Exception('Simulated message creation failure')
+
+        feedback_services.create_message = mock_create_message_that_fails
+
+        try:
+            # Attempt to create thread - should propagate the exception
+            with self.assertRaisesRegex(Exception, 'Simulated message creation failure'):
+                feedback_services.create_thread(
+                    entity_type, entity_id, original_author_id, subject, text
+                )
+
+            # Verify no thread was left behind (transaction rolled back)
+            threads = feedback_services.get_all_threads(entity_type, entity_id, False)
+            self.assertEqual(len(threads), 0)
+
+            # Verify no message was created
+            # (This is implicit since no thread exists)
+        finally:
+            # Restore original function
+            feedback_services.create_message = original_create_message
+
+    def test_create_thread_existing_thread_with_no_message_creates_message(self) -> None:
+        """Test that creating a thread when one exists without a message creates the message."""
+        entity_type = 'exploration'
+        entity_id = 'exp_id_4'
+        original_author_id = self.user_id
+        subject = 'Test Subject'
+        text = 'Test message text'
+
+        # Create a thread manually without a message (simulating partial creation)
+        thread_id = feedback_models.GeneralFeedbackThreadModel.generate_new_thread_id(
+            entity_type, entity_id
+        )
+        thread_model = feedback_models.GeneralFeedbackThreadModel.create(thread_id)
+        thread_model.entity_type = entity_type
+        thread_model.entity_id = entity_id
+        thread_model.original_author_id = original_author_id
+        thread_model.status = feedback_models.STATUS_CHOICES_OPEN
+        thread_model.subject = subject
+        thread_model.message_count = 0
+        thread_model.put()
+
+        # Verify thread exists but has no message
+        thread_model = feedback_models.GeneralFeedbackThreadModel.get_by_id(thread_id)
+        self.assertIsNotNone(thread_model)
+        self.assertEqual(thread_model.message_count, 0)
+
+        # Now call create_thread - should create the message
+        returned_thread_id = feedback_services.create_thread(
+            entity_type, entity_id, original_author_id, subject, text
+        )
+
+        # Should return the same thread ID
+        self.assertEqual(returned_thread_id, thread_id)
+
+        # Verify thread now has a message
+        thread_model = feedback_models.GeneralFeedbackThreadModel.get_by_id(thread_id)
+        self.assertEqual(thread_model.message_count, 1)
+
+        # Verify the message was created correctly
+        messages = feedback_services.get_messages(thread_id)
+        self.assertEqual(len(messages), 1)
+        message = messages[0]
+        self.assertEqual(message.text, text)
+        self.assertEqual(message.original_author_id, original_author_id)
+
+    def test_create_thread_existing_thread_with_message_does_nothing(self) -> None:
+        """Test that creating a thread when one exists with a message does nothing."""
+        entity_type = 'exploration'
+        entity_id = 'exp_id_5'
+        original_author_id = self.user_id
+        subject = 'Test Subject'
+        text = 'Test message text'
+
+        # Create a thread with a message using the normal process
+        thread_id = feedback_services.create_thread(
+            entity_type, entity_id, original_author_id, subject, text
+        )
+
+        # Verify thread and message exist
+        thread_model = feedback_models.GeneralFeedbackThreadModel.get_by_id(thread_id)
+        self.assertIsNotNone(thread_model)
+        self.assertEqual(thread_model.message_count, 1)
+
+        messages = feedback_services.get_messages(thread_id)
+        self.assertEqual(len(messages), 1)
+        original_message = messages[0]
+        original_message_text = original_message.text
+
+        # Now call create_thread again with different parameters
+        returned_thread_id = feedback_services.create_thread(
+            entity_type, entity_id, original_author_id, 'Different Subject', 'Different text'
+        )
+
+        # Should return the same thread ID (no change)
+        self.assertEqual(returned_thread_id, thread_id)
+
+        # Verify thread still exists and is unchanged
+        thread_model = feedback_models.GeneralFeedbackThreadModel.get_by_id(thread_id)
+        self.assertIsNotNone(thread_model)
+        self.assertEqual(thread_model.subject, subject)  # Original subject
+        self.assertEqual(thread_model.message_count, 1)  # Still one message
+
+        # Verify message is unchanged
+        messages = feedback_services.get_messages(thread_id)
+        self.assertEqual(len(messages), 1)
+        message = messages[0]
+        self.assertEqual(message.text, original_message_text)  # Original text
+
     def test_create_message_raises_exception_for_invalid_thread_id(
         self,
     ) -> None:
